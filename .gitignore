@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+venv/
+.env
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# YOLO / ML
+yolov8*.pt
+
+# Generated data
+snapshots/
+backups/
+
+# OS
+.DS_Store
+Thumbs.db

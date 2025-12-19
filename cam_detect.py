@@ -3,14 +3,21 @@ cam_tracker_db.py – FIXED 100%
 - No 'can't set attribute id' crash
 - Proper filtering without modifying YOLO structures
 """
-
+import time
+from captioner import caption_image_path
+from utils import get_zone_from_bbox
+import db
 import os
 import time
 import cv2
 import sqlite3
 import numpy as np
+import json
 from datetime import datetime
 from ultralytics import YOLO
+
+_caption_ts = {}       # tracker_id -> last caption timestamp
+CAPTION_COOLDOWN = 30  # seconds between captions per tracker (adjust if CPU slow)
 
 DB_PATH = "object_memory.db"
 SNAPSHOT_DIR = "snapshots"
@@ -23,34 +30,68 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 # -----------------------------
 # DATABASE SETUP
 # -----------------------------
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-c = conn.cursor()
-c.execute("""
-CREATE TABLE IF NOT EXISTS detections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    object_name TEXT,
-    tracker_id INTEGER,
-    timestamp TEXT,
-    bbox TEXT,
-    snapshot_path TEXT
-)
-""")
-conn.commit()
+import threading
+import queue
 
+# Queue for paths that need captioning: (snapshot_path, detection_row_id)
+caption_queue = queue.Queue()
 
-def store_detection(object_name, tracker_id, bbox, snapshot):
-    ts = datetime.now().isoformat()
-    bbox_s = ",".join(map(str, bbox))
-    filename = f"{object_name}_{tracker_id}_{int(time.time())}.jpg"
-    path = os.path.join(SNAPSHOT_DIR, filename)
-    cv2.imwrite(path, snapshot)
+# Thread-safe store for completed captions: snapshot_path -> (caption, detection_row_id)
+caption_results = {}
 
-    c.execute(
-        "INSERT INTO detections (object_name, tracker_id, timestamp, bbox, snapshot_path) VALUES (?, ?, ?, ?, ?)",
-        (object_name, tracker_id, ts, bbox_s, path)
-    )
-    conn.commit()
-    return path
+def in_window_text_input_nonblocking(window_name, cap, prompt="Find object >>> "):
+    text = ""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            return None
+
+        h, w = frame.shape[:2]
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, h-40), (w, h), (0,0,0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+        cv2.putText(frame, prompt + text, (10, h-10), font, 0.7, (255,255,255), 2)
+
+        cv2.imshow(window_name, frame)
+        k = cv2.waitKey(1) & 0xFF
+
+        if k in [13, 10]:   # Enter
+            return text.strip()
+
+        if k == 27:         # ESC
+            return None
+
+        if k in [8, 127]:   # Backspace
+            text = text[:-1]
+            continue
+
+        if 32 <= k <= 126:  # printable characters
+            text += chr(k)
+            continue
+
+def caption_worker():
+    while True:
+        item = caption_queue.get()
+        if item is None:
+            # poison pill — exit thread
+            caption_queue.task_done()
+            break
+        snapshot_path, detection_row_id = item
+        try:
+            cap_text = caption_image_path(snapshot_path)
+        except Exception:
+            cap_text = ""
+        # store result
+        caption_results[snapshot_path] = (cap_text, detection_row_id)
+        caption_queue.task_done()
+
+# start worker thread (daemon so it won't block exit)
+caption_thread = threading.Thread(target=caption_worker, daemon=True)
+caption_thread.start()
 
 
 # -----------------------------
@@ -108,8 +149,50 @@ try:
                     continue
 
                 crop_small = cv2.resize(crop, (224, 224))
-                snap = store_detection(label, obj_id, (x1, y1, x2, y2), crop_small)
+                snapshot_path = db.store_image_snapshot(crop_small, path_hint=f"{label}_{obj_id}")
+                zone = get_zone_from_bbox(x1, y1, x2, y2, frame.shape[1], frame.shape[0])
 
+                # Insert detection WITHOUT caption (will be filled later)
+                record_id = db.insert_detection(label, obj_id, (x1, y1, x2, y2), snapshot_path, caption=None, zone=zone)
+
+                # Queue the snapshot for background captioning
+                caption_queue.put((snapshot_path, record_id))
+
+                # update named object last_locations (caption will be updated later)
+                obj_named_id = db.update_object(label, label)
+                db.add_movement(obj_named_id, x1, y1, x2=x2, y2=y2, snapshot_path=snapshot_path, caption=None, zone=zone, tracker_id=obj_id)
+
+
+        if caption_results:
+            # copy keys to avoid mutation during iteration
+            ready_keys = list(caption_results.keys())
+            for snap_path in ready_keys:
+                cap_text, rec_id = caption_results.pop(snap_path)
+                try:
+                    with db.get_db() as conn:
+                        cur = conn.cursor()
+                        cur.execute("UPDATE detections SET caption=? WHERE id=?", (cap_text, rec_id))
+                        # also update last_locations snapshot/caption for named_objects if needed:
+                        # find named_object id(s) that reference this snapshot path and update last_locations entries
+                        cur.execute("SELECT id FROM named_objects WHERE snapshot_path = ? LIMIT 1", (snap_path,))
+                        row = cur.fetchone()
+                        if row:
+                            # simple update — prepend to last_locations json using Python then save
+                            obj_id = row["id"]
+                            cur.execute("SELECT last_locations FROM named_objects WHERE id = ? LIMIT 1", (obj_id,))
+                            lr = cur.fetchone()["last_locations"]
+                            try:
+                                arr = json.loads(lr) if lr else []
+                            except Exception:
+                                arr = []
+                            # update any matching entries with same snapshot_path
+                            for loc in arr:
+                                if loc.get("snapshot_path") == snap_path:
+                                    loc["caption"] = cap_text
+                            cur.execute("UPDATE named_objects SET last_locations = ? WHERE id = ?", (json.dumps(arr), obj_id))
+                except Exception:
+                    # if DB update fails for any reason, ignore and continue
+                    pass
         cv2.imshow("Lost Object Finder", frame)
 
         key = cv2.waitKey(1) & 0xFF
@@ -118,25 +201,43 @@ try:
             break
 
         if key == ord('f'):
-            name = input("Find object >>> ").strip().lower()
+            name = in_window_text_input_nonblocking("Lost Object Finder", cap)
             if not name:
                 continue
 
-            c.execute(
-                "SELECT object_name, tracker_id, timestamp, bbox, snapshot_path "
-                "FROM detections WHERE object_name LIKE ? ORDER BY id DESC LIMIT 1",
-                (f"%{name}%",)
-            )
-            row = c.fetchone()
+            name = name.lower()
 
+            row = db.get_last_detection_of_label(name)
             if not row:
                 print("No record found.")
             else:
-                obj_name, tracker_id, ts, bbox_s, snap = row
-                x1, y1, x2, y2 = map(int, bbox_s.split(","))
+                x1, y1, x2, y2 = row["bbox"]
+                snap = row["snapshot_path"]
 
                 snap_img = cv2.imread(snap)
-                cv2.imshow("Last Seen Snapshot", snap_img)
+                if snap_img is not None:
+                    cv2.imshow("Last Seen Snapshot", snap_img)
+
+                highlight = frame.copy()
+                cv2.rectangle(highlight, (x1, y1), (x2, y2), (0,0,255), 3)
+                cv2.imshow("Lost Object Finder", highlight)
+                cv2.waitKey(0)
+            if not name:
+                continue
+
+            row = db.get_last_detection_of_label(name)
+            if not row:
+                print("No record found.")
+            else:
+                obj_name = row["object_label"]
+                tracker_id = row["tracker_id"]
+                ts = row["timestamp"]
+                x1, y1, x2, y2 = row["bbox"]
+                snap = row["snapshot_path"]
+
+                snap_img = cv2.imread(snap) if snap else None
+                if snap_img is not None:
+                    cv2.imshow("Last Seen Snapshot", snap_img)
 
                 highlight = frame.copy()
                 cv2.rectangle(highlight, (x1, y1), (x2, y2), (0, 0, 255), 3)
@@ -146,5 +247,7 @@ try:
 finally:
     cap.release()
     cv2.destroyAllWindows()
-    conn.close()
+    # stop caption thread gracefully
+    caption_queue.put(None)
+    caption_thread.join(timeout=2)
     print("Closed cleanly.")
